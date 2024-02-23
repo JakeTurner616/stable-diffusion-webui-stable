@@ -1,10 +1,9 @@
-from __future__ import annotations
-
 import re
 from collections import namedtuple
+from typing import List
 import lark
 
-# a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75][ in foreground::0.6][: in background:0.25] [shoddy:masterful:0.5]"
+# a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75][ in foreground::0.6][ in background:0.25] [shoddy:masterful:0.5]"
 # will be represented with prompt_schedule like this (assuming steps=100):
 # [25, 'fantasy landscape with a mountain and an oak in foreground shoddy']
 # [50, 'fantasy landscape with a lake and an oak in foreground in background shoddy']
@@ -18,14 +17,14 @@ prompt: (emphasized | scheduled | alternate | plain | WHITESPACE)*
 !emphasized: "(" prompt ")"
         | "(" prompt ":" prompt ")"
         | "[" prompt "]"
-scheduled: "[" [prompt ":"] prompt ":" [WHITESPACE] NUMBER [WHITESPACE] "]"
-alternate: "[" prompt ("|" [prompt])+ "]"
+scheduled: "[" [prompt ":"] prompt ":" [WHITESPACE] NUMBER "]"
+alternate: "[" prompt ("|" prompt)+ "]"
 WHITESPACE: /\s+/
 plain: /([^\\\[\]():|]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
 """)
 
-def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=None, use_old_scheduling=False):
+def get_learned_conditioning_prompt_schedules(prompts, steps):
     """
     >>> g = lambda p: get_learned_conditioning_prompt_schedules([p], 10)[0]
     >>> g("test")
@@ -52,61 +51,32 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
     [[3, '((a][:b:c '], [10, '((a][:b:c d']]
     >>> g("[a|(b:1.1)]")
     [[1, 'a'], [2, '(b:1.1)'], [3, 'a'], [4, '(b:1.1)'], [5, 'a'], [6, '(b:1.1)'], [7, 'a'], [8, '(b:1.1)'], [9, 'a'], [10, '(b:1.1)']]
-    >>> g("[fe|]male")
-    [[1, 'female'], [2, 'male'], [3, 'female'], [4, 'male'], [5, 'female'], [6, 'male'], [7, 'female'], [8, 'male'], [9, 'female'], [10, 'male']]
-    >>> g("[fe|||]male")
-    [[1, 'female'], [2, 'male'], [3, 'male'], [4, 'male'], [5, 'female'], [6, 'male'], [7, 'male'], [8, 'male'], [9, 'female'], [10, 'male']]
-    >>> g = lambda p: get_learned_conditioning_prompt_schedules([p], 10, 10)[0]
-    >>> g("a [b:.5] c")
-    [[10, 'a b c']]
-    >>> g("a [b:1.5] c")
-    [[5, 'a  c'], [10, 'a b c']]
     """
 
-    if hires_steps is None or use_old_scheduling:
-        int_offset = 0
-        flt_offset = 0
-        steps = base_steps
-    else:
-        int_offset = base_steps
-        flt_offset = 1.0
-        steps = hires_steps
-
     def collect_steps(steps, tree):
-        res = [steps]
-
+        l = [steps]
         class CollectSteps(lark.Visitor):
             def scheduled(self, tree):
-                s = tree.children[-2]
-                v = float(s)
-                if use_old_scheduling:
-                    v = v*steps if v<1 else v
-                else:
-                    if "." in s:
-                        v = (v - flt_offset) * steps
-                    else:
-                        v = (v - int_offset)
-                tree.children[-2] = min(steps, int(v))
-                if tree.children[-2] >= 1:
-                    res.append(tree.children[-2])
-
+                tree.children[-1] = float(tree.children[-1])
+                if tree.children[-1] < 1:
+                    tree.children[-1] *= steps
+                tree.children[-1] = min(steps, int(tree.children[-1]))
+                l.append(tree.children[-1])
             def alternate(self, tree):
-                res.extend(range(1, steps+1))
-
+                l.extend(range(1, steps+1))
         CollectSteps().visit(tree)
-        return sorted(set(res))
+        return sorted(set(l))
 
     def at_step(step, tree):
         class AtStep(lark.Transformer):
             def scheduled(self, args):
-                before, after, _, when, _ = args
+                before, after, _, when = args
                 yield before or () if step <= when else after
             def alternate(self, args):
-                args = ["" if not arg else arg for arg in args]
-                yield args[(step - 1) % len(args)]
+                yield next(args[(step - 1)%len(args)])
             def start(self, args):
                 def flatten(x):
-                    if isinstance(x, str):
+                    if type(x) == str:
                         yield x
                     else:
                         for gen in x:
@@ -122,7 +92,7 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
     def get_schedule(prompt):
         try:
             tree = schedule_parser.parse(prompt)
-        except lark.exceptions.LarkError:
+        except lark.exceptions.LarkError as e:
             if 0:
                 import traceback
                 traceback.print_exc()
@@ -136,25 +106,7 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 ScheduledPromptConditioning = namedtuple("ScheduledPromptConditioning", ["end_at_step", "cond"])
 
 
-class SdConditioning(list):
-    """
-    A list with prompts for stable diffusion's conditioner model.
-    Can also specify width and height of created image - SDXL needs it.
-    """
-    def __init__(self, prompts, is_negative_prompt=False, width=None, height=None, copy_from=None):
-        super().__init__()
-        self.extend(prompts)
-
-        if copy_from is None:
-            copy_from = prompts
-
-        self.is_negative_prompt = is_negative_prompt or getattr(copy_from, 'is_negative_prompt', False)
-        self.width = width or getattr(copy_from, 'width', None)
-        self.height = height or getattr(copy_from, 'height', None)
-
-
-
-def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, hires_steps=None, use_old_scheduling=False):
+def get_learned_conditioning(model, prompts, steps):
     """converts a list of prompts into a list of prompt schedules - each schedule is a list of ScheduledPromptConditioning, specifying the comdition (cond),
     and the sampling step at which this condition is to be replaced by the next one.
 
@@ -174,7 +126,7 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
     """
     res = []
 
-    prompt_schedules = get_learned_conditioning_prompt_schedules(prompts, steps, hires_steps, use_old_scheduling)
+    prompt_schedules = get_learned_conditioning_prompt_schedules(prompts, steps)
     cache = {}
 
     for prompt, prompt_schedule in zip(prompts, prompt_schedules):
@@ -184,17 +136,12 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
             res.append(cached)
             continue
 
-        texts = SdConditioning([x[1] for x in prompt_schedule], copy_from=prompts)
+        texts = [x[1] for x in prompt_schedule]
         conds = model.get_learned_conditioning(texts)
 
         cond_schedule = []
-        for i, (end_at_step, _) in enumerate(prompt_schedule):
-            if isinstance(conds, dict):
-                cond = {k: v[i] for k, v in conds.items()}
-            else:
-                cond = conds[i]
-
-            cond_schedule.append(ScheduledPromptConditioning(end_at_step, cond))
+        for i, (end_at_step, text) in enumerate(prompt_schedule):
+            cond_schedule.append(ScheduledPromptConditioning(end_at_step, conds[i]))
 
         cache[prompt] = cond_schedule
         res.append(cond_schedule)
@@ -203,15 +150,13 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
 
 
 re_AND = re.compile(r"\bAND\b")
-re_weight = re.compile(r"^((?:\s|.)*?)(?:\s*:\s*([-+]?(?:\d+\.?|\d*\.\d+)))?\s*$")
+re_weight = re.compile(r"^(.*?)(?:\s*:\s*([-+]?(?:\d+\.?|\d*\.\d+)))?\s*$")
 
-
-def get_multicond_prompt_list(prompts: SdConditioning | list[str]):
+def get_multicond_prompt_list(prompts):
     res_indexes = []
 
+    prompt_flat_list = []
     prompt_indexes = {}
-    prompt_flat_list = SdConditioning(prompts)
-    prompt_flat_list.clear()
 
     for prompt in prompts:
         subprompts = re_AND.split(prompt)
@@ -239,17 +184,16 @@ def get_multicond_prompt_list(prompts: SdConditioning | list[str]):
 
 class ComposableScheduledPromptConditioning:
     def __init__(self, schedules, weight=1.0):
-        self.schedules: list[ScheduledPromptConditioning] = schedules
+        self.schedules: List[ScheduledPromptConditioning] = schedules
         self.weight: float = weight
 
 
 class MulticondLearnedConditioning:
     def __init__(self, shape, batch):
         self.shape: tuple = shape  # the shape field is needed to send this object to DDIM/PLMS
-        self.batch: list[list[ComposableScheduledPromptConditioning]] = batch
+        self.batch: List[List[ComposableScheduledPromptConditioning]] = batch
 
-
-def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, use_old_scheduling=False) -> MulticondLearnedConditioning:
+def get_multicond_learned_conditioning(model, prompts, steps) -> MulticondLearnedConditioning:
     """same as get_learned_conditioning, but returns a list of ScheduledPromptConditioning along with the weight objects for each prompt.
     For each prompt, the list is obtained by splitting the prompt using the AND separator.
 
@@ -258,7 +202,7 @@ def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, 
 
     res_indexes, prompt_flat_list, prompt_indexes = get_multicond_prompt_list(prompts)
 
-    learned_conditioning = get_learned_conditioning(model, prompt_flat_list, steps, hires_steps, use_old_scheduling)
+    learned_conditioning = get_learned_conditioning(model, prompt_flat_list, steps)
 
     res = []
     for indexes in res_indexes:
@@ -267,55 +211,18 @@ def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, 
     return MulticondLearnedConditioning(shape=(len(prompts),), batch=res)
 
 
-class DictWithShape(dict):
-    def __init__(self, x, shape):
-        super().__init__()
-        self.update(x)
-
-    @property
-    def shape(self):
-        return self["crossattn"].shape
-
-
-def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step):
+def reconstruct_cond_batch(c: List[List[ScheduledPromptConditioning]], current_step):
     param = c[0][0].cond
-    is_dict = isinstance(param, dict)
-
-    if is_dict:
-        dict_cond = param
-        res = {k: torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype) for k, param in dict_cond.items()}
-        res = DictWithShape(res, (len(c),) + dict_cond['crossattn'].shape)
-    else:
-        res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
-
+    res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
     for i, cond_schedule in enumerate(c):
         target_index = 0
-        for current, entry in enumerate(cond_schedule):
-            if current_step <= entry.end_at_step:
+        for current, (end_at, cond) in enumerate(cond_schedule):
+            if current_step <= end_at:
                 target_index = current
                 break
-
-        if is_dict:
-            for k, param in cond_schedule[target_index].cond.items():
-                res[k][i] = param
-        else:
-            res[i] = cond_schedule[target_index].cond
+        res[i] = cond_schedule[target_index].cond
 
     return res
-
-
-def stack_conds(tensors):
-    # if prompts have wildly different lengths above the limit we'll get tensors of different shapes
-    # and won't be able to torch.stack them. So this fixes that.
-    token_count = max([x.shape[0] for x in tensors])
-    for i in range(len(tensors)):
-        if tensors[i].shape[0] != token_count:
-            last_vector = tensors[i][-1:]
-            last_vector_repeated = last_vector.repeat([token_count - tensors[i].shape[0], 1])
-            tensors[i] = torch.vstack([tensors[i], last_vector_repeated])
-
-    return torch.stack(tensors)
-
 
 
 def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
@@ -324,13 +231,13 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
     tensors = []
     conds_list = []
 
-    for composable_prompts in c.batch:
+    for batch_no, composable_prompts in enumerate(c.batch):
         conds_for_batch = []
 
-        for composable_prompt in composable_prompts:
+        for cond_index, composable_prompt in enumerate(composable_prompts):
             target_index = 0
-            for current, entry in enumerate(composable_prompt.schedules):
-                if current_step <= entry.end_at_step:
+            for current, (end_at, cond) in enumerate(composable_prompt.schedules):
+                if current_step <= end_at:
                     target_index = current
                     break
 
@@ -339,14 +246,16 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
 
         conds_list.append(conds_for_batch)
 
-    if isinstance(tensors[0], dict):
-        keys = list(tensors[0].keys())
-        stacked = {k: stack_conds([x[k] for x in tensors]) for k in keys}
-        stacked = DictWithShape(stacked, stacked['crossattn'].shape)
-    else:
-        stacked = stack_conds(tensors).to(device=param.device, dtype=param.dtype)
+    # if prompts have wildly different lengths above the limit we'll get tensors fo different shapes
+    # and won't be able to torch.stack them. So this fixes that.
+    token_count = max([x.shape[0] for x in tensors])
+    for i in range(len(tensors)):
+        if tensors[i].shape[0] != token_count:
+            last_vector = tensors[i][-1:]
+            last_vector_repeated = last_vector.repeat([token_count - tensors[i].shape[0], 1])
+            tensors[i] = torch.vstack([tensors[i], last_vector_repeated])
 
-    return conds_list, stacked
+    return conds_list, torch.stack(tensors).to(device=param.device, dtype=param.dtype)
 
 
 re_attention = re.compile(r"""
@@ -358,7 +267,7 @@ re_attention = re.compile(r"""
 \\|
 \(|
 \[|
-:\s*([+-]?[.\d]+)\s*\)|
+:([+-]?[.\d]+)\)|
 \)|
 ]|
 [^\\()\[\]:]+|
@@ -424,11 +333,11 @@ def parse_prompt_attention(text):
             round_brackets.append(len(res))
         elif text == '[':
             square_brackets.append(len(res))
-        elif weight is not None and round_brackets:
+        elif weight is not None and len(round_brackets) > 0:
             multiply_range(round_brackets.pop(), float(weight))
-        elif text == ')' and round_brackets:
+        elif text == ')' and len(round_brackets) > 0:
             multiply_range(round_brackets.pop(), round_bracket_multiplier)
-        elif text == ']' and square_brackets:
+        elif text == ']' and len(square_brackets) > 0:
             multiply_range(square_brackets.pop(), square_bracket_multiplier)
         else:
             parts = re.split(re_break, text)

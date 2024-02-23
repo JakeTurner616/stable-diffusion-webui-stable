@@ -1,19 +1,18 @@
 import copy
+import math
+import os
 import random
+import sys
+import traceback
 import shlex
 
 import modules.scripts as scripts
 import gradio as gr
 
-from modules import sd_samplers, errors, sd_models
+from modules import sd_samplers
 from modules.processing import Processed, process_images
-from modules.shared import state
-
-
-def process_model_tag(tag):
-    info = sd_models.get_closet_checkpoint_match(tag)
-    assert info is not None, f'Unknown checkpoint: {tag}'
-    return info.name
+from PIL import Image
+from modules.shared import opts, cmd_opts, state
 
 
 def process_string_tag(tag):
@@ -33,7 +32,7 @@ def process_boolean_tag(tag):
 
 
 prompt_tags = {
-    "sd_model": process_model_tag,
+    "sd_model": None,
     "outpath_samples": process_string_tag,
     "outpath_grids": process_string_tag,
     "prompt_for_display": process_string_tag,
@@ -101,34 +100,35 @@ def cmdargs(line):
 
 def load_prompt_file(file):
     if file is None:
-        return None, gr.update(), gr.update(lines=7)
+        lines = []
     else:
         lines = [x.strip() for x in file.decode('utf8', errors='ignore').split("\n")]
-        return None, "\n".join(lines), gr.update(lines=7)
+
+    return None, "\n".join(lines), gr.update(lines=7)
 
 
 class Script(scripts.Script):
     def title(self):
         return "Prompts from file or textbox"
 
-    def ui(self, is_img2img):
+    def ui(self, is_img2img):       
         checkbox_iterate = gr.Checkbox(label="Iterate seed every line", value=False, elem_id=self.elem_id("checkbox_iterate"))
         checkbox_iterate_batch = gr.Checkbox(label="Use same random seed for all lines", value=False, elem_id=self.elem_id("checkbox_iterate_batch"))
-        prompt_position = gr.Radio(["start", "end"], label="Insert prompts at the", elem_id=self.elem_id("prompt_position"), value="start")
 
         prompt_txt = gr.Textbox(label="List of prompt inputs", lines=1, elem_id=self.elem_id("prompt_txt"))
         file = gr.File(label="Upload prompt inputs", type='binary', elem_id=self.elem_id("file"))
 
-        file.change(fn=load_prompt_file, inputs=[file], outputs=[file, prompt_txt, prompt_txt], show_progress=False)
+        file.change(fn=load_prompt_file, inputs=[file], outputs=[file, prompt_txt, prompt_txt])
 
         # We start at one line. When the text changes, we jump to seven lines, or two lines if no \n.
         # We don't shrink back to 1, because that causes the control to ignore [enter], and it may
         # be unclear to the user that shift-enter is needed.
-        prompt_txt.change(lambda tb: gr.update(lines=7) if ("\n" in tb) else gr.update(lines=2), inputs=[prompt_txt], outputs=[prompt_txt], show_progress=False)
-        return [checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt]
+        prompt_txt.change(lambda tb: gr.update(lines=7) if ("\n" in tb) else gr.update(lines=2), inputs=[prompt_txt], outputs=[prompt_txt])
+        return [checkbox_iterate, checkbox_iterate_batch, prompt_txt]
 
-    def run(self, p, checkbox_iterate, checkbox_iterate_batch, prompt_position, prompt_txt: str):
-        lines = [x for x in (x.strip() for x in prompt_txt.splitlines()) if x]
+    def run(self, p, checkbox_iterate, checkbox_iterate_batch, prompt_txt: str):
+        lines = [x.strip() for x in prompt_txt.splitlines()]
+        lines = [x for x in lines if len(x) > 0]
 
         p.do_not_save_grid = True
 
@@ -140,7 +140,8 @@ class Script(scripts.Script):
                 try:
                     args = cmdargs(line)
                 except Exception:
-                    errors.report(f"Error parsing line {line} as commandline", exc_info=True)
+                    print(f"Error parsing line {line} as commandline:", file=sys.stderr)
+                    print(traceback.format_exc(), file=sys.stderr)
                     args = {"prompt": line}
             else:
                 args = {"prompt": line}
@@ -158,31 +159,16 @@ class Script(scripts.Script):
         images = []
         all_prompts = []
         infotexts = []
-        for args in jobs:
+        for n, args in enumerate(jobs):
             state.job = f"{state.job_no + 1} out of {state.job_count}"
 
             copy_p = copy.copy(p)
             for k, v in args.items():
-                if k == "sd_model":
-                    copy_p.override_settings['sd_model_checkpoint'] = v
-                else:
-                    setattr(copy_p, k, v)
-
-            if args.get("prompt") and p.prompt:
-                if prompt_position == "start":
-                    copy_p.prompt = args.get("prompt") + " " + p.prompt
-                else:
-                    copy_p.prompt = p.prompt + " " + args.get("prompt")
-
-            if args.get("negative_prompt") and p.negative_prompt:
-                if prompt_position == "start":
-                    copy_p.negative_prompt = args.get("negative_prompt") + " " + p.negative_prompt
-                else:
-                    copy_p.negative_prompt = p.negative_prompt + " " + args.get("negative_prompt")
+                setattr(copy_p, k, v)
 
             proc = process_images(copy_p)
             images += proc.images
-
+            
             if checkbox_iterate:
                 p.seed = p.seed + (p.batch_size * p.n_iter)
             all_prompts += proc.all_prompts

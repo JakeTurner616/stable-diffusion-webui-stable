@@ -1,22 +1,24 @@
+import csv
 import datetime
 import glob
 import html
 import os
+import sys
+import traceback
 import inspect
-from contextlib import closing
 
 import modules.textual_inversion.dataset
 import torch
 import tqdm
 from einops import rearrange, repeat
 from ldm.util import default
-from modules import devices, sd_models, shared, sd_samplers, hashes, sd_hijack_checkpoint, errors
+from modules import devices, processing, sd_models, shared, sd_samplers, hashes, sd_hijack_checkpoint
 from modules.textual_inversion import textual_inversion, logging
 from modules.textual_inversion.learn_schedule import LearnRateScheduler
 from torch import einsum
 from torch.nn.init import normal_, xavier_normal_, xavier_uniform_, kaiming_normal_, kaiming_uniform_, zeros_
 
-from collections import deque
+from collections import defaultdict, deque
 from statistics import stdev, mean
 
 
@@ -176,34 +178,34 @@ class Hypernetwork:
 
     def weights(self):
         res = []
-        for layers in self.layers.values():
+        for k, layers in self.layers.items():
             for layer in layers:
                 res += layer.parameters()
         return res
 
     def train(self, mode=True):
-        for layers in self.layers.values():
+        for k, layers in self.layers.items():
             for layer in layers:
                 layer.train(mode=mode)
                 for param in layer.parameters():
                     param.requires_grad = mode
 
     def to(self, device):
-        for layers in self.layers.values():
+        for k, layers in self.layers.items():
             for layer in layers:
                 layer.to(device)
 
         return self
 
     def set_multiplier(self, multiplier):
-        for layers in self.layers.values():
+        for k, layers in self.layers.items():
             for layer in layers:
                 layer.multiplier = multiplier
 
         return self
 
     def eval(self):
-        for layers in self.layers.values():
+        for k, layers in self.layers.items():
             for layer in layers:
                 layer.eval()
                 for param in layer.parameters():
@@ -324,13 +326,16 @@ def load_hypernetwork(name):
     if path is None:
         return None
 
+    hypernetwork = Hypernetwork()
+
     try:
-        hypernetwork = Hypernetwork()
         hypernetwork.load(path)
-        return hypernetwork
     except Exception:
-        errors.report(f"Error loading hypernetwork {path}", exc_info=True)
+        print(f"Error loading hypernetwork {path}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
         return None
+
+    return hypernetwork
 
 
 def load_hypernetworks(names, multipliers=None):
@@ -352,6 +357,17 @@ def load_hypernetworks(names, multipliers=None):
 
         hypernetwork.set_multiplier(multipliers[i] if multipliers else 1.0)
         shared.loaded_hypernetworks.append(hypernetwork)
+
+
+def find_closest_hypernetwork_name(search: str):
+    if not search:
+        return None
+    search = search.lower()
+    applicable = [name for name in shared.hypernetworks if search in name.lower()]
+    if not applicable:
+        return None
+    applicable = sorted(applicable, key=lambda name: len(name))
+    return applicable[0]
 
 
 def apply_single_hypernetwork(hypernetwork, context_k, context_v, layer=None):
@@ -378,7 +394,7 @@ def apply_hypernetworks(hypernetworks, context, layer=None):
     return context_k, context_v
 
 
-def attention_CrossAttention_forward(self, x, context=None, mask=None, **kwargs):
+def attention_CrossAttention_forward(self, x, context=None, mask=None):
     h = self.heads
 
     q = self.to_q(x)
@@ -388,7 +404,7 @@ def attention_CrossAttention_forward(self, x, context=None, mask=None, **kwargs)
     k = self.to_k(context_k)
     v = self.to_v(context_v)
 
-    q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h=h) for t in (q, k, v))
+    q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
     sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
@@ -436,6 +452,18 @@ def statistics(data):
     return total_information, recent_information
 
 
+def report_statistics(loss_info:dict):
+    keys = sorted(loss_info.keys(), key=lambda x: sum(loss_info[x]) / len(loss_info[x]))
+    for key in keys:
+        try:
+            print("Loss statistics for file " + key)
+            info, recent = statistics(list(loss_info[key]))
+            print(info)
+            print(recent)
+        except Exception as e:
+            print(e)
+
+
 def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False, dropout_structure=None):
     # Remove illegal characters from name.
     name = "".join( x for x in name if (x.isalnum() or x in "._- "))
@@ -468,8 +496,9 @@ def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None,
     shared.reload_hypernetworks()
 
 
-def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch_size: int, gradient_step: int, data_root: str, log_directory: str, training_width: int, training_height: int, varsize: bool, steps: int, clip_grad_mode: str, clip_grad_value: float, shuffle_tags: bool, tag_drop_out: bool, latent_sampling_method: str, use_weight: bool, create_image_every: int, save_hypernetwork_every: int, template_filename: str, preview_from_txt2img: bool, preview_prompt: str, preview_negative_prompt: str, preview_steps: int, preview_sampler_name: str, preview_cfg_scale: float, preview_seed: int, preview_width: int, preview_height: int):
-    from modules import images, processing
+def train_hypernetwork(id_task, hypernetwork_name, learn_rate, batch_size, gradient_step, data_root, log_directory, training_width, training_height, varsize, steps, clip_grad_mode, clip_grad_value, shuffle_tags, tag_drop_out, latent_sampling_method, use_weight, create_image_every, save_hypernetwork_every, template_filename, preview_from_txt2img, preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height):
+    # images allows training previews to have infotext. Importing it at the top causes a circular import problem.
+    from modules import images
 
     save_hypernetwork_every = save_hypernetwork_every or 0
     create_image_every = create_image_every or 0
@@ -512,7 +541,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
         return hypernetwork, filename
 
     scheduler = LearnRateScheduler(learn_rate, steps, initial_step)
-
+    
     clip_grad = torch.nn.utils.clip_grad_value_ if clip_grad_mode == "value" else torch.nn.utils.clip_grad_norm_ if clip_grad_mode == "norm" else None
     if clip_grad:
         clip_grad_sched = LearnRateScheduler(clip_grad_value, steps, initial_step, verbose=False)
@@ -565,7 +594,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
             print(e)
 
     scaler = torch.cuda.amp.GradScaler()
-
+    
     batch_size = ds.batch_size
     gradient_step = ds.gradient_step
     # n steps = batch_size * gradient_step * n image processed
@@ -591,7 +620,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
     try:
         sd_hijack_checkpoint.add()
 
-        for _ in range((steps-initial_step) * gradient_step):
+        for i in range((steps-initial_step) * gradient_step):
             if scheduler.finished:
                 break
             if shared.state.interrupted:
@@ -608,7 +637,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
 
                 if clip_grad:
                     clip_grad_sched.step(hypernetwork.step)
-
+                
                 with devices.autocast():
                     x = batch.latent_sample.to(devices.device, non_blocking=pin_memory)
                     if use_weight:
@@ -629,14 +658,14 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
 
                     _loss_step += loss.item()
                 scaler.scale(loss).backward()
-
+                
                 # go back until we reach gradient accumulation steps
                 if (j + 1) % gradient_step != 0:
                     continue
                 loss_logging.append(_loss_step)
                 if clip_grad:
                     clip_grad(weights, clip_grad_sched.learn_rate)
-
+                
                 scaler.step(optimizer)
                 scaler.update()
                 hypernetwork.step += 1
@@ -646,7 +675,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
                 _loss_step = 0
 
                 steps_done = hypernetwork.step + 1
-
+                
                 epoch_num = hypernetwork.step // steps_per_epoch
                 epoch_step = hypernetwork.step % steps_per_epoch
 
@@ -698,7 +727,7 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
                         p.prompt = preview_prompt
                         p.negative_prompt = preview_negative_prompt
                         p.steps = preview_steps
-                        p.sampler_name = sd_samplers.samplers_map[preview_sampler_name.lower()]
+                        p.sampler_name = sd_samplers.samplers[preview_sampler_index].name
                         p.cfg_scale = preview_cfg_scale
                         p.seed = preview_seed
                         p.width = preview_width
@@ -711,9 +740,8 @@ def train_hypernetwork(id_task, hypernetwork_name: str, learn_rate: float, batch
 
                     preview_text = p.prompt
 
-                    with closing(p):
-                        processed = processing.process_images(p)
-                        image = processed.images[0] if len(processed.images) > 0 else None
+                    processed = processing.process_images(p)
+                    image = processed.images[0] if len(processed.images) > 0 else None
 
                     if unload:
                         shared.sd_model.cond_stage_model.to(devices.cpu)
@@ -743,11 +771,12 @@ Last saved image: {html.escape(last_saved_image)}<br/>
 </p>
 """
     except Exception:
-        errors.report("Exception in training hypernetwork", exc_info=True)
+        print(traceback.format_exc(), file=sys.stderr)
     finally:
         pbar.leave = False
         pbar.close()
         hypernetwork.eval()
+        #report_statistics(loss_dict)
         sd_hijack_checkpoint.remove()
 
 

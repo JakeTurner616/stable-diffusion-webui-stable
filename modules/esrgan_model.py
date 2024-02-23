@@ -1,20 +1,24 @@
-import sys
+import os
 
 import numpy as np
 import torch
 from PIL import Image
+from basicsr.utils.download_util import load_file_from_url
 
 import modules.esrgan_model_arch as arch
-from modules import modelloader, images, devices
-from modules.shared import opts
+from modules import shared, modelloader, images, devices
 from modules.upscaler import Upscaler, UpscalerData
+from modules.shared import opts
+
 
 
 def mod2normal(state_dict):
     # this code is copied from https://github.com/victorca25/iNNfer
     if 'conv_first.weight' in state_dict:
         crt_net = {}
-        items = list(state_dict)
+        items = []
+        for k, v in state_dict.items():
+            items.append(k)
 
         crt_net['model.0.weight'] = state_dict['conv_first.weight']
         crt_net['model.0.bias'] = state_dict['conv_first.bias']
@@ -48,7 +52,9 @@ def resrgan2normal(state_dict, nb=23):
     if "conv_first.weight" in state_dict and "body.0.rdb1.conv1.weight" in state_dict:
         re8x = 0
         crt_net = {}
-        items = list(state_dict)
+        items = []
+        for k, v in state_dict.items():
+            items.append(k)
 
         crt_net['model.0.weight'] = state_dict['conv_first.weight']
         crt_net['model.0.bias'] = state_dict['conv_first.bias']
@@ -132,7 +138,7 @@ class UpscalerESRGAN(Upscaler):
             scaler_data = UpscalerData(self.model_name, self.model_url, self, 4)
             scalers.append(scaler_data)
         for file in model_paths:
-            if file.startswith("http"):
+            if "http" in file:
                 name = self.model_name
             else:
                 name = modelloader.friendly_name(file)
@@ -141,25 +147,23 @@ class UpscalerESRGAN(Upscaler):
             self.scalers.append(scaler_data)
 
     def do_upscale(self, img, selected_model):
-        try:
-            model = self.load_model(selected_model)
-        except Exception as e:
-            print(f"Unable to load ESRGAN model {selected_model}: {e}", file=sys.stderr)
+        model = self.load_model(selected_model)
+        if model is None:
             return img
         model.to(devices.device_esrgan)
         img = esrgan_upscale(model, img)
         return img
 
     def load_model(self, path: str):
-        if path.startswith("http"):
-            # TODO: this doesn't use `path` at all?
-            filename = modelloader.load_file_from_url(
-                url=self.model_url,
-                model_dir=self.model_download_path,
-                file_name=f"{self.model_name}.pth",
-            )
+        if "http" in path:
+            filename = load_file_from_url(url=self.model_url, model_dir=self.model_path,
+                                          file_name="%s.pth" % self.model_name,
+                                          progress=True)
         else:
             filename = path
+        if not os.path.exists(filename) or filename is None:
+            print("Unable to load %s from %s" % (self.model_path, filename))
+            return None
 
         state_dict = torch.load(filename, map_location='cpu' if devices.device_esrgan.type == 'mps' else None)
 

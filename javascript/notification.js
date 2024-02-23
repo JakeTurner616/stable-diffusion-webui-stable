@@ -2,20 +2,20 @@
 
 let lastHeadImg = null;
 
-let notificationButton = null;
+notificationButton = null
 
-onAfterUiUpdate(function() {
-    if (notificationButton == null) {
-        notificationButton = gradioApp().getElementById('request_notifications');
+onUiUpdate(function(){
+    if(notificationButton == null){
+        notificationButton = gradioApp().getElementById('request_notifications')
 
-        if (notificationButton != null) {
-            notificationButton.addEventListener('click', () => {
-                void Notification.requestPermission();
-            }, true);
+        if(notificationButton != null){
+            notificationButton.addEventListener('click', function (evt) {
+                Notification.requestPermission();
+            },true);
         }
     }
 
-    const galleryPreviews = gradioApp().querySelectorAll('div[id^="tab_"] div[id$="_results"] .thumbnail-item > img');
+    const galleryPreviews = gradioApp().querySelectorAll('div[id^="tab_"][style*="display: block"] div[id$="_results"] .thumbnail-item > img');
 
     if (galleryPreviews == null) return;
 
@@ -26,11 +26,7 @@ onAfterUiUpdate(function() {
     lastHeadImg = headImg;
 
     // play notification sound if available
-    const notificationAudio = gradioApp().querySelector('#audio_notification audio');
-    if (notificationAudio) {
-        notificationAudio.volume = opts.notification_volume / 100.0 || 1.0;
-        notificationAudio.play();
-    }
+    gradioApp().querySelector('#audio_notification audio')?.play();
 
     if (document.hasFocus()) return;
 
@@ -46,7 +42,7 @@ onAfterUiUpdate(function() {
         }
     );
 
-    notification.onclick = function(_) {
+    notification.onclick = function(_){
         parent.focus();
         this.close();
     };
